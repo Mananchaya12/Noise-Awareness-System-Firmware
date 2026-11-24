@@ -12,13 +12,13 @@
 #include <esp_sleep.h>
 #include <math.h>
 #include <string.h>
-#include <NAS_Classification_fi_inferencing.h>
+#include <NAS_Classification_V3_inferencing.h>
 
 
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* TB_HOST = "YOUR_THINGSBOARD_HOST";
-const char* TB_TOKEN = "YOUR_DEVICE_ACCESS_TOKEN";
+const char* WIFI_SSID = "L";
+const char* WIFI_PASSWORD = "22222222";
+const char* TB_HOST = "thingsboard.cloud";
+const char* TB_TOKEN = "mtd16oEeuz1JeIJIQGLD";
 constexpr uint16_t TB_PORT = 1883;
 
 constexpr bool ENABLE_DEEP_SLEEP = true;
@@ -51,6 +51,13 @@ constexpr size_t DB_WINDOW = SAMPLE_RATE / 2;
 constexpr size_t AUDIO_WINDOW = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
 constexpr float MIC_GAIN = 1.0f;
 constexpr float DB_OFFSET = -17.0f;
+// A quiet 5-second capture becomes Unknown only at the NEXT AI result.
+// Tune the dB threshold to match the quiet-room reading on this device.
+constexpr float QUIET_DB_THRESHOLD = 58.0f;
+constexpr uint8_t QUIET_WINDOWS_PER_CAPTURE = 8; // >=8 of 10 half-second windows
+
+constexpr float DB_HIGHPASS_HZ = 80.0f;
+constexpr float DB_FILTER_ALPHA = (1.0f / (2.0f * PI * DB_HIGHPASS_HZ)) / ((1.0f / (2.0f * PI * DB_HIGHPASS_HZ)) + 1.0f / SAMPLE_RATE);
 
 const double REF_RMS_PCM16 = (420426.0 / sqrt(2.0)) / 256.0;
 
@@ -75,6 +82,8 @@ constexpr uint32_t VOICE_TIMEOUT_MS = 15000;
 constexpr uint8_t DF_VOLUME = 22;
 
 constexpr uint16_t TRACK_CRITICAL = 2;
+constexpr uint32_t LED_RUN_INTERVAL_MS = 180;
+constexpr uint32_t LED_RUN_MIN_MS = 5000;
 
 
 I2SClass mic;
@@ -92,12 +101,16 @@ bool webAckPending = false;
 uint32_t webLastAckAttempt = 0;
 bool aiHasResult = false;
 bool audioHasReading = false;
+uint8_t quietWindowsThisCapture = 0;
+uint8_t totalDbWindowsThisCapture = 0;
 
 int32_t rawBlock[BLOCK_SIZE];
 int16_t* pcmBuffer = nullptr;
 size_t sampleIndex = 0;
 size_t dbSamples = 0;
 double dbSum = 0.0, dbSquares = 0.0;
+float dbHpPrevInput = 0.0f;
+float dbHpPrevOutput = 0.0f;
 float currentDb = 0.0f;
 float currentAcRms = 0.0f;
 float sumDbPeriod = 0.0f, maxDbPeriod = -1000.0f;
@@ -114,24 +127,50 @@ bool voiceBusySeenLow = false;
 uint16_t activeVoiceTrack = 0;
 bool radarLast = false;
 bool pendingCritical = false;
+bool pendingVoiceCritical = false;
 bool criticalSentOnce = false;
+bool voiceCriticalSentOnce = false;
 uint32_t lastCriticalEventAt = 0;
+uint32_t lastVoiceCriticalAt = 0;
 uint32_t noPersonFrom = 0;
 uint32_t voiceStartedAt = 0;
 uint32_t voiceFinishedAt = 0;
 uint32_t lastTelemetryAt = 0;
 uint32_t lastWiFiTryAt = 0;
 uint32_t lastMqttTryAt = 0;
+bool alertLedRunning = false;
+uint32_t alertLedStartedAt = 0;
+uint32_t lastLedStepAt = 0;
+uint8_t ledStep = 0;
 
+
+bool alertConditionsMet() {
+  return audioHasReading && isfinite(currentDb) &&
+         currentDb >= criticalDb && isPresent() && aiHasResult &&
+         (strcmp(detectedClass, "Speech") == 0 ||
+          strcmp(detectedClass, "Music") == 0);
+}
+
+bool voiceCriticalConditionsMet() {
+  // Same conditions as running LEDs / critical event.
+  return alertConditionsMet();
+}
+
+void queueVoiceAtNoiseLimit(const char* source) {
+  if (!voiceCriticalConditionsMet()) return;
+  if (voiceCriticalSentOnce && millis() - lastVoiceCriticalAt < VOICE_COOLDOWN_MS) return;
+  if (pendingVoiceCritical || voicePlaying || voiceSettling || !dfReady) return;
+  pendingVoiceCritical = true;
+  Serial.printf("DFPlayer threshold (%s): %.1f >= noise_limit %.1f dB\n",
+                source, currentDb, criticalDb);
+}
 
 void queueCriticalAtNoiseLimit(const char* source) {
-  if (!audioHasReading || !isfinite(currentDb) || currentDb < criticalDb) return;
+  if (!alertConditionsMet()) return;
   if (criticalSentOnce && millis() - lastCriticalEventAt < VOICE_COOLDOWN_MS) return;
-  if (pendingCritical) return;
+  if (pendingCritical || voicePlaying || voiceSettling) return;
   pendingCritical = true;
-  criticalSentOnce = true;
-  lastCriticalEventAt = millis();
-  Serial.printf("CRITICAL (%s): measured %.1f >= noise_limit %.1f dB; DFPlayer /mp3/0002.mp3 queued\n",
+  Serial.printf("CRITICAL (%s): Speech/Music + Presence + %.1f >= noise_limit %.1f dB\n",
                 source, currentDb, criticalDb);
 }
 
@@ -148,9 +187,32 @@ void ledsOff() {
   digitalWrite(LED3, HIGH);
 }
 void updateLeds(float db) {
-  digitalWrite(LED1, db > 75.0f ? LOW : HIGH);
-  digitalWrite(LED2, db >= 80.0f ? LOW : HIGH);
-  digitalWrite(LED3, db >= criticalDb ? LOW : HIGH);
+  (void)db;
+  if (!alertLedRunning) ledsOff();
+}
+
+void startRunningLeds() {
+  alertLedRunning = true;
+  alertLedStartedAt = millis();
+  lastLedStepAt = millis() - LED_RUN_INTERVAL_MS;
+  ledStep = 0;
+}
+
+void serviceRunningLeds() {
+  if (!alertLedRunning) return;
+  uint32_t now = millis();
+  if (!voicePlaying && !voiceSettling &&
+      now - alertLedStartedAt >= LED_RUN_MIN_MS) {
+    alertLedRunning = false;
+    ledsOff();
+    return;
+  }
+  if (now - lastLedStepAt < LED_RUN_INTERVAL_MS) return;
+  lastLedStepAt = now;
+  ledsOff();
+  const int pins[3] = {LED1, LED2, LED3};
+  digitalWrite(pins[ledStep], LOW);
+  ledStep = (ledStep + 1) % 3;
 }
 
 void displayScreen(const char* status) {
@@ -173,7 +235,7 @@ void displayScreen(const char* status) {
   oled.print("Score: "); oled.print(confidence * 100.0f, 1); oled.println("%");
   oled.setCursor(0, 58);
   oled.print("P:"); oled.print(isPresent() ? "YES" : "NO");
-  oled.print(" Alert:"); oled.print("ON");
+  oled.print(" Limit:"); oled.print(criticalDb, 0);
   oled.display();
 }
 
@@ -182,6 +244,10 @@ void resetCapture() {
   dbSamples = 0;
   dbSum = 0;
   dbSquares = 0;
+  dbHpPrevInput = 0.0f;
+  dbHpPrevOutput = 0.0f;
+  quietWindowsThisCapture = 0;
+  totalDbWindowsThisCapture = 0;
 }
 
 bool startMic() {
@@ -243,36 +309,28 @@ void sendEvery30s() {
   snprintf(json, sizeof(json),
     "{\"sound_db\":%.1f,\"sound_db_avg\":%.1f,\"sound_db_max\":%.1f,"
     "\"sound_class\":\"%s\",\"confidence\":%.3f,\"presence\":%s,"
-    "\"speech_with_presence\":%s,\"alert_muted\":%s,\"critical_db\":%.1f}",
+    "\"speech_with_presence\":%s,\"critical_db\":%.1f}",
     currentDb, mean, maximum, detectedClass, confidence,
     isPresent() ? "true" : "false",
     (isPresent() && strcmp(detectedClass, "Speech") == 0) ? "true" : "false",
-    "false", criticalDb);
+    criticalDb);
   publishTelemetry(json);
 
 
-  const char* websiteSoundType = "Unknown";
-  if (aiHasResult) {
-    if (strcmp(detectedClass, "Speech") == 0) websiteSoundType = "Speech";
-    else if (strcmp(detectedClass, "Music") == 0) websiteSoundType = "Music / Media";
-    else if (strcmp(detectedClass, "Noise") == 0) websiteSoundType = "Background Noise";
-  }
-
-
   bool validAudio = audioHasReading && isfinite(currentDb) && micReady;
-  bool currentAlert = validAudio && currentDb >= criticalDb;
+  bool currentAlert = validAudio && alertConditionsMet();
   char webJson[360];
   if (aiHasResult) {
     snprintf(webJson, sizeof(webJson),
-      "{\"sound_db\":%.1f,\"sound_type\":\"%s\",\"confidence\":%.3f,"
+      "{\"sound_db\":%.1f,\"confidence\":%.3f,"
       "\"noise_limit\":%.1f,\"alert\":%s,\"presence\":%s,"
       "\"audio_valid\":%s,\"device_status\":\"awake\"}",
-      currentDb, websiteSoundType, confidence, criticalDb,
+      currentDb, confidence, criticalDb,
       currentAlert ? "true" : "false", isPresent() ? "true" : "false",
       validAudio ? "true" : "false");
   } else {
     snprintf(webJson, sizeof(webJson),
-      "{\"sound_db\":%.1f,\"sound_type\":\"Unknown\","
+      "{\"sound_db\":%.1f,"
       "\"noise_limit\":%.1f,\"alert\":%s,\"presence\":%s,"
       "\"audio_valid\":%s,\"device_status\":\"awake\"}",
       currentDb, criticalDb, currentAlert ? "true" : "false",
@@ -344,9 +402,9 @@ bool applyWebsiteConfig(JsonVariantConst container) {
   webConfigActive = true;
   webAckPending = true;
   updateLeds(currentDb);
-
-
+  queueVoiceAtNoiseLimit("website update");
   queueCriticalAtNoiseLimit("website update");
+
   displayScreen("WEB CONFIG");
   Serial.printf("Website: applied noise_limit=%.1f dB, version=%llu\n",
                 criticalDb, (unsigned long long)webAppliedVersion);
@@ -365,6 +423,8 @@ void applyCriticalDb(float candidate) {
   criticalDb = candidate;
   preferences.putFloat("criticalDb", criticalDb);
   updateLeds(currentDb);
+  queueVoiceAtNoiseLimit("legacy attribute update");
+  queueCriticalAtNoiseLimit("legacy attribute update");
   Serial.printf("ThingsBoard: CRITICAL THRESHOLD UPDATED to %.1f dB\n", criticalDb);
   displayScreen("THRESHOLD SET");
 }
@@ -445,11 +505,12 @@ bool startVoice(uint16_t track) {
   }
   stopMic();
   resetCapture();
+  aiHasResult = false;
   voicePlaying = true;
   voiceBusySeenLow = false;
   activeVoiceTrack = track;
   voiceStartedAt = millis();
-  displayScreen("VOICE");
+  displayScreen("ALERT");
   dfplayer.playMp3Folder(track);
   Serial.printf("DFPlayer: /mp3/%04u.mp3\n", (unsigned)track);
   return true;
@@ -510,6 +571,7 @@ void goToSleep() {
   mqtt.disconnect();
   WiFi.disconnect(true);
   stopMic();
+  alertLedRunning = false;
   ledsOff();
   if (oledReady) { oled.clearDisplay(); oled.display(); }
 
@@ -555,16 +617,23 @@ void updateDbWindow() {
   currentDb = (float)(rawDb + DB_OFFSET);
   audioHasReading = true;
 
+  // Count quiet intervals but keep the PREVIOUS AI label visible until
+  // the complete next 5-second capture has finished.
+  if (totalDbWindowsThisCapture < 255) ++totalDbWindowsThisCapture;
+  if (currentDb < QUIET_DB_THRESHOLD && quietWindowsThisCapture < 255)
+    ++quietWindowsThisCapture;
+
   Serial.printf("dB*: %.1f | Raw dB: %.1f | AC RMS: %.1f | Radar: %d\n",
                 currentDb, rawDb, currentAcRms, isPresent());
   sumDbPeriod += currentDb;
   nDbPeriod++;
   if (currentDb > maxDbPeriod) maxDbPeriod = currentDb;
   updateLeds(currentDb);
+  queueVoiceAtNoiseLimit("sound meter");
+  queueCriticalAtNoiseLimit("sound meter");
   displayScreen("LISTENING");
 
 
-  queueCriticalAtNoiseLimit("microphone");
   dbSamples = 0;
   dbSum = 0;
   dbSquares = 0;
@@ -572,11 +641,23 @@ void updateDbWindow() {
 void processAlerts() {
   if (pendingCritical) {
     pendingCritical = false;
-    displayScreen("CRITICAL");
-    Serial.println("EVENT CRITICAL");
-
-    startVoice(TRACK_CRITICAL);
-    sendEvent("critical");
+    if (alertConditionsMet()) {
+      displayScreen("CRITICAL");
+      Serial.println("EVENT CRITICAL: Speech/Music + person + noise limit");
+      criticalSentOnce = true;
+      lastCriticalEventAt = millis();
+      startRunningLeds();
+      sendEvent("critical");
+    }
+  }
+  if (pendingVoiceCritical) {
+    pendingVoiceCritical = false;
+    if (voiceCriticalConditionsMet() && !voicePlaying && !voiceSettling) {
+      if (startVoice(TRACK_CRITICAL)) {
+        voiceCriticalSentOnce = true;
+        lastVoiceCriticalAt = millis();
+      }
+    }
   }
 }
 
@@ -587,6 +668,22 @@ static int getSignal(size_t offset, size_t length, float* dest) {
   return 0;
 }
 void inferAudio() {
+  // Only update the label at the NEXT completed 5-second AI window.
+  // A mostly silent window becomes Unknown without running the 3-class model.
+  if (totalDbWindowsThisCapture >= QUIET_WINDOWS_PER_CAPTURE &&
+      quietWindowsThisCapture >= QUIET_WINDOWS_PER_CAPTURE) {
+    strncpy(detectedClass, "Unknown", sizeof(detectedClass));
+    detectedClass[sizeof(detectedClass) - 1] = '\0';
+    confidence = 0.0f;
+    aiHasResult = false;
+    pendingCritical = false;
+    pendingVoiceCritical = false;
+    Serial.printf("AI NEXT WINDOW: quiet %u/%u windows below %.1f dB* -> Unknown\n",
+                  (unsigned)quietWindowsThisCapture,
+                  (unsigned)totalDbWindowsThisCapture, QUIET_DB_THRESHOLD);
+    displayScreen("QUIET / UNKNOWN");
+    return;
+  }
   signal_t signal;
   signal.total_length = AUDIO_WINDOW;
   signal.get_data = getSignal;
@@ -615,6 +712,8 @@ void inferAudio() {
     detectedClass, confidence * 100.0f,
     result.timing.dsp, result.timing.classification);
   displayScreen("AI READY");
+  queueCriticalAtNoiseLimit("AI Speech/Music result");
+  queueVoiceAtNoiseLimit("AI Speech/Music result");
 }
 
 void collectMicChunk() {
@@ -635,8 +734,12 @@ void collectMicChunk() {
     if (adjusted < -32768.0f) adjusted = -32768.0f;
     int16_t pcm = (int16_t)adjusted;
     pcmBuffer[sampleIndex++] = pcm;
-    dbSum += pcm;
-    dbSquares += (double)pcm * pcm;
+    float filterInput = (float)pcm;
+    float filteredDbSample = DB_FILTER_ALPHA * (dbHpPrevOutput + filterInput - dbHpPrevInput);
+    dbHpPrevInput = filterInput;
+    dbHpPrevOutput = filteredDbSample;
+    dbSum += filteredDbSample;
+    dbSquares += (double)filteredDbSample * filteredDbSample;
     dbSamples++;
     if (dbSamples == DB_WINDOW) updateDbWindow();
   }
@@ -645,7 +748,7 @@ void collectMicChunk() {
 void setup() {
   Serial.begin(115200);
   delay(1200);
-  Serial.println("\n========= NAS V2 NEW AI 1.0.2 + EXT1 WAKE =========");
+  Serial.println("\n========= NAS V2 AI V3 1.0.4 + EXT1 WAKE =========");
   auto wakeReason = esp_sleep_get_wakeup_cause();
   Serial.printf("DeepSleep=%s | WakeReason=%d\n", ENABLE_DEEP_SLEEP ? "ON" : "OFF",
                 (int)wakeReason);
@@ -653,10 +756,12 @@ void setup() {
   else Serial.println("BOOT: power on / reset");
   Serial.println("MIC: BCLK8 WS9 SD10 | OLED: SDA16 SCL15 | RADAR: OUT11");
   Serial.println("DFPlayer: ESP RX2 / TX1 / BUSY12 | Radar UART: ESP RX18 / TX17 (unused)");
-  Serial.printf("AI MODEL: %u Hz / %u samples\n", (unsigned)EI_CLASSIFIER_FREQUENCY,
+  Serial.printf("Quiet window: >=%u quiet half-second segments / 5s below %.1f dB* -> Unknown at next result\n",
+                (unsigned)QUIET_WINDOWS_PER_CAPTURE, QUIET_DB_THRESHOLD);
+  Serial.printf("AI MODEL V3 1.0.4: %u Hz / %u samples\n", (unsigned)EI_CLASSIFIER_FREQUENCY,
                 (unsigned)AUDIO_WINDOW);
   if (EI_CLASSIFIER_FREQUENCY != SAMPLE_RATE || AUDIO_WINDOW != 80000) {
-    Serial.println("ERROR: model must use 16000Hz / 80000 samples. Check NAS_Classification_fi_inferencing ZIP!");
+    Serial.println("ERROR: model must use 16000Hz / 80000 samples. Check NAS_Classification_V3_inferencing ZIP!");
     while (true) delay(1000);
   }
 
@@ -698,6 +803,7 @@ void setup() {
   delay(2000);
   warmupMic();
   Serial.println("Microphone I2S: READY");
+  Serial.printf("dB high-pass filter: %.0f Hz (AI audio unchanged)\n", DB_HIGHPASS_HZ);
 
   if (DF_BUSY >= 0) pinMode(DF_BUSY, INPUT_PULLUP);
   dfPort.begin(9600, SERIAL_8N1, DF_RX, DF_TX);
@@ -744,14 +850,14 @@ void setup() {
   lastMqttTryAt = millis() - 15000;
   lastTelemetryAt = millis();
   resetCapture();
-  Serial.printf("SYSTEM READY - Critical >=%.1f dB (first 0.5s window)\n", criticalDb);
-  Serial.printf("LED GREEN GPIO6 >75 / YELLOW GPIO5 >=80 / RED GPIO4 >=%.1f dB\n", criticalDb);
+  Serial.printf("SYSTEM READY - LED/Event: Speech/Music + Presence + dB >= %.1f\n", criticalDb);
+  Serial.printf("DFPlayer: Presence + dB >= %.1f, independent of Speech\n", criticalDb);
+  Serial.println("Running LEDs GPIO6 -> GPIO5 -> GPIO4 during alert");
   Serial.println("ThingsBoard legacy key: SHARED critical_db (80..110)");
   Serial.println("Website priority: SHARED noise_limit (0..140) + config_version");
-  Serial.println("Website sync: CLIENT applied_config_version; telemetry sound_type, alert, audio_valid, device_status");
+  Serial.println("Website sync: CLIENT applied_config_version; telemetry sound_class, alert, audio_valid, device_status");
   Serial.println("Radar: deep sleep after 30s ABSENT; EXT1 GPIO11 wake");
-  Serial.println("Voice commands disabled; DFPlayer critical alert /mp3/0002.mp3 remains enabled");
-  Serial.println("Speech/Music/Noise classifier enabled; no keyword recognition");
+  Serial.println("Music/Noise/Speech classifier enabled (V3 1.0.4); DFPlayer follows LED conditions");
   displayScreen("LISTENING");
 }
 
@@ -759,6 +865,7 @@ void loop() {
   serviceNetwork();
   monitorRadar();
   serviceVoice();
+  serviceRunningLeds();
 
   uint32_t now = millis();
   if (!voicePlaying && !voiceSettling &&
@@ -781,8 +888,11 @@ void loop() {
 
   collectMicChunk();
   processAlerts();
-  if (!voicePlaying && sampleIndex >= AUDIO_WINDOW) {
+  if (!voicePlaying && !voiceSettling && sampleIndex >= AUDIO_WINDOW) {
     inferAudio();
     sampleIndex = 0;
+    quietWindowsThisCapture = 0;
+    totalDbWindowsThisCapture = 0;
   }
+  processAlerts();
 }
